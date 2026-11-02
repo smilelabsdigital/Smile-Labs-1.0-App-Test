@@ -25,16 +25,49 @@ function selectEditPrompt(style,shade){
  throw Error('Invalid treatment or whitening shade.');
 }
 
+// Neon persistence: one durable document for the existing account model. Intended for a
+// single Render web-service instance; use relational tables/transactions before scaling.
+const DATABASE_URL=typeof process==='undefined'?null:process.env.DATABASE_URL;
+let pool=null;
 let db={users:[],events:[]},writeQueue=Promise.resolve();
-async function init(){try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;await save();}}
-function save(){writeQueue=writeQueue.then(async()=>{await fs.mkdir(path.dirname(DATA),{recursive:true});const tmp=DATA+'.tmp';await fs.writeFile(tmp,JSON.stringify(db,null,2),{mode:0o600});await fs.rename(tmp,DATA);});return writeQueue;}
+async function init(){
+ if(DATABASE_URL){
+  const {Pool}=require('pg');
+  pool=new Pool({connectionString:DATABASE_URL,max:3,connectionTimeoutMillis:15000,idleTimeoutMillis:30000});
+  await pool.query('CREATE TABLE IF NOT EXISTS smile_labs_state (id integer PRIMARY KEY CHECK (id=1), payload jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())');
+  const result=await pool.query('SELECT payload FROM smile_labs_state WHERE id=1');
+  if(result.rows.length){db=result.rows[0].payload;console.log('Loaded accounts and usage from Neon.');}
+  else{
+   // Initial import for local development only; Render's ephemeral old JSON
+   // files generally cannot be recovered after a redeploy.
+   try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+   await save();
+   console.log('Initialised durable Neon account storage.');
+  }
+ }else{
+  if(process.env.NODE_ENV==='production')throw Error('DATABASE_URL is required in production to prevent lost registrations.');
+  try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;await save();}
+  console.warn('Development mode: accounts saved locally only.');
+ }
+ if(!Array.isArray(db.users))db.users=[];
+ if(!Array.isArray(db.events))db.events=[];
+}
+function save(){
+ // Snapshot immediately, so queued saves cannot accidentally skip intermediate state.
+ const snapshot=JSON.stringify(db);
+ writeQueue=writeQueue.catch(e=>{console.error('Previous storage write failed:',e);}).then(async()=>{
+  if(pool){await pool.query('INSERT INTO smile_labs_state (id,payload,updated_at) VALUES (1,$1::jsonb,now()) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=now()', [snapshot]);}
+  else {await fs.mkdir(path.dirname(DATA),{recursive:true});const tmp=DATA+'.tmp';await fs.writeFile(tmp,snapshot,{mode:0o600});await fs.rename(tmp,DATA);}
+ });
+ return writeQueue;
+}
 function reply(res,status,obj){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(obj));}
 async function readBody(req,limit=20*1024*1024){let a=[],n=0;for await(const ch of req){n+=ch.length;if(n>limit)throw Error('Request too large.');a.push(ch);}return JSON.parse(Buffer.concat(a).toString('utf8'));}
 const clean=(v,max=120)=>typeof v==='string'?v.trim().slice(0,max):'';
 const emailOK=s=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)&&s.length<=254;
-function token(user){const payload=Buffer.from(JSON.stringify({id:user.id,exp:Date.now()+7*86400000})).toString('base64url');return payload+'.'+crypto.createHmac('sha256',SECRET).update(payload).digest('base64url');}
+function token(user){const payload=Buffer.from(JSON.stringify({id:user.id,exp:Date.now()+30*86400000})).toString('base64url');return payload+'.'+crypto.createHmac('sha256',SECRET).update(payload).digest('base64url');}
 function current(req){try{const raw=(req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith('sl_session='))?.slice(11)||'';const [p,s]=raw.split('.');if(!p||!s)return null;const valid=crypto.createHmac('sha256',SECRET).update(p).digest('base64url');if(!crypto.timingSafeEqual(Buffer.from(s),Buffer.from(valid)))return null;const d=JSON.parse(Buffer.from(p,'base64url').toString());return d.exp>Date.now()?db.users.find(u=>u.id===d.id)||null:null;}catch{return null;}}
-function cookie(res,user){res.setHeader('Set-Cookie',`sl_session=${token(user)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.COOKIE_SECURE==='true'?'; Secure':''}`);}
+function cookie(res,user){res.setHeader('Set-Cookie',`sl_session=${token(user)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`);}
 // Quotas are computed separately by role. Professional credits reset each calendar month (UTC).
 const currentMonth=()=>new Date().toISOString().slice(0,7);
 const guestLimit=()=>50; // Temporary prototype guest allowance, per browser cookie
@@ -292,12 +325,13 @@ async function api(req,res,route){
   // Demonstration-only 50 uses per signed browser cookie, not strong anti-abuse.
   const cookieVal=(req.headers.cookie||'').split(';').map(v=>v.trim()).find(v=>v.startsWith('sl_guest_token='))?.slice(15)||'';
   let guest=db.users.find(u=>u.role==='public'&&u.guestTokenHash&&crypto.createHash('sha256').update(cookieVal).digest('hex')===u.guestTokenHash);
-  if(cookieVal && !guest)return reply(res,403,{error:'Guest session could not be restored on this browser. Dental professionals can sign in.'});
+  // If a guest token no longer exists in storage, start a fresh guest session.
+  // The original guest's previous credits cannot be recovered without the record.
   if(!guest){
    const raw=crypto.randomBytes(32).toString('base64url');
    guest={id:crypto.randomUUID(),role:'public',name:'Guest',email:'',phone:'',address:'',clinic:'',gdc:'',verified:true,approved:false,used:0,month:currentMonth(),created:new Date().toISOString(),guestTokenHash:crypto.createHash('sha256').update(raw).digest('hex')};
    db.users.push(guest);await save();
-   res.setHeader('Set-Cookie',[`sl_guest_token=${raw}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`,`sl_session=${token(guest)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.COOKIE_SECURE==='true'?'; Secure':''}`]);
+   res.setHeader('Set-Cookie',[`sl_guest_token=${raw}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`,`sl_session=${token(guest)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`]);
   }else cookie(res,guest);
   return reply(res,200,{user:publicUser(guest)});
  }
